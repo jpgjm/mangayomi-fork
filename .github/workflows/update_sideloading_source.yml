@@ -1,0 +1,48 @@
+name: Update Sideloading Source
+
+on:
+  workflow_call:
+  workflow_dispatch: # Allow manual triggering of this workflow
+
+permissions:
+  # The job commits the regenerated source list and pushes it.
+  contents: write
+
+jobs:
+  update-source:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.4.0
+        with:
+          fetch-depth: 0
+          ref: main
+  
+      - name: Get Latest Release Tag
+        run: echo "RELEASE_TAG=$(git describe --tags --abbrev=0)" >> $GITHUB_ENV
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4.9.1
+        with:
+          python-version: '3.12'
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run source updater
+        run: python repo/update_source.py
+
+      - name: Commit and Push changes
+        run: |
+          git config --global user.name 'GitHub Action'
+          git config --global user.email 'action@github.com'
+          git add repo/source.json
+          if git diff --cached --quiet; then
+            echo "No changes detected, skipping commit."
+          else
+            git commit -m "source update: $RELEASE_TAG"
+            git push
+          fi
