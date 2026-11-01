@@ -181,16 +181,23 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      # Signing is optional: without the P12/provisioning secrets the job
+      # packages an UNSIGNED ipa, which is what SideStore/AltStore want
+      # anyway (they re-sign on install).
       - name: Setup signing environment
         env:
           P12_BASE64: ${{ secrets.P12_CERTIFICATE }}
           PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE }}
         run: |
-          echo "$P12_BASE64" | base64 -d > certificate.p12
-          echo "$PROVISIONING_PROFILE_BASE64" | base64 -d > profile.mobileprovision
-          curl -L -o zsign.zip "https://github.com/zhlynn/zsign/releases/download/v${{ env.ZSIGN_VERSION }}/zsign-v${{ env.ZSIGN_VERSION }}-macos-x64.zip"
-          unzip zsign.zip
-          chmod +x zsign || chmod +x zsign-*
+          if [ -n "$P12_BASE64" ] && [ -n "$PROVISIONING_PROFILE_BASE64" ]; then
+            echo "$P12_BASE64" | base64 -d > certificate.p12
+            echo "$PROVISIONING_PROFILE_BASE64" | base64 -d > profile.mobileprovision
+            curl -L -o zsign.zip "https://github.com/zhlynn/zsign/releases/download/v${{ env.ZSIGN_VERSION }}/zsign-v${{ env.ZSIGN_VERSION }}-macos-x64.zip"
+            unzip zsign.zip
+            chmod +x zsign || chmod +x zsign-*
+          else
+            echo "Signing secrets not set; will package an unsigned ipa."
+          fi
 
       - name: Build iOS
         env:
@@ -199,7 +206,9 @@ jobs:
           flutter build ios --release --no-codesign
           mkdir -p build/ios/iphoneos/Payload
           mv build/ios/iphoneos/Runner.app build/ios/iphoneos/Payload/
-          ./zsign -f -k ./certificate.p12 -p "$P12_PASSWORD" -m ./profile.mobileprovision ./build/ios/iphoneos/Payload/Runner.app
+          if [ -f ./certificate.p12 ]; then
+            ./zsign -f -k ./certificate.p12 -p "$P12_PASSWORD" -m ./profile.mobileprovision ./build/ios/iphoneos/Payload/Runner.app
+          fi
           cd build/ios/iphoneos
           zip -r Mangayomi-${{ github.ref_name }}-ios.ipa Payload
 
