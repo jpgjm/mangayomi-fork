@@ -1,0 +1,147 @@
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:mangayomi/utils/haptics.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mangayomi/models/settings.dart';
+import 'package:mangayomi/modules/library/providers/library_filter_provider.dart';
+import 'package:mangayomi/modules/library/providers/library_state_provider.dart';
+import 'package:mangayomi/models/manga.dart';
+import 'package:mangayomi/modules/manga/detail/providers/state_providers.dart';
+import 'package:mangayomi/modules/manga/widgets/manga_image_card_widget.dart';
+import 'package:mangayomi/utils/cached_network.dart';
+import 'package:mangayomi/utils/constant.dart';
+import 'package:mangayomi/utils/headers.dart';
+import 'package:mangayomi/utils/extensions/manga_extensions.dart';
+import 'package:mangayomi/providers/l10n_providers.dart';
+import 'package:shiori/shiori.dart';
+
+import 'package:mangayomi/modules/widgets/entry_badge_chip.dart';
+
+export 'package:mangayomi/modules/widgets/entry_badge_chip.dart';
+
+/// Resolves the correct [ImageProvider] for a manga entry, preferring a custom
+/// local cover over the remote URL. Remote covers are wrapped in
+/// [coverProvider] so they decode at thumbnail resolution rather than the
+/// source resolution — see refs #609.
+ImageProvider resolveCoverImage(Manga entry, WidgetRef ref) {
+  if (entry.customCoverImage != null) {
+    return MemoryImage(entry.customCoverImage as Uint8List);
+  }
+  // An orphaned/corrupted entry can have a null source or lang (e.g. its
+  // source was uninstalled, or a legacy record). Skip source headers in that
+  // case instead of force-unwrapping — otherwise the whole tile throws while
+  // building and the entry becomes an un-removable "gray square". See #708.
+  final canUseSourceHeaders =
+      !(entry.isLocalArchive ?? false) &&
+      entry.source != null &&
+      entry.lang != null;
+  return coverProvider(
+    toImgUrl(entry.customCoverFromTracker ?? entry.imageUrl ?? ''),
+    headers: canUseSourceHeaders
+        ? ref.watch(
+            headersProvider(
+              source: entry.source!,
+              lang: entry.lang!,
+              sourceId: entry.sourceId,
+            ),
+          )
+        : null,
+  );
+}
+
+/// Handles a long-press or secondary tap on a library entry.
+///
+/// Toggles long-press selection mode on the first activation, then simply
+/// toggles the individual entry on subsequent taps.
+void handleLongOrSecondaryTap(bool isLongPressed, WidgetRef ref, Manga entry) {
+  ref.read(mangasListStateProvider.notifier).update(entry);
+  if (!isLongPressed) {
+    selectionHaptic();
+    ref.read(isLongPressedStateProvider.notifier).update(!isLongPressed);
+  }
+}
+
+/// Handles a primary tap on a library entry.
+///
+/// In selection mode ([isLongPressed]) it toggles the entry. Otherwise it
+/// navigates to the reader and refreshes the library providers on return.
+Future<void> onTapEntry({
+  required bool isLongPressed,
+  required WidgetRef ref,
+  required BuildContext context,
+  required Manga entry,
+}) async {
+  if (isLongPressed) {
+    ref.read(mangasListStateProvider.notifier).update(entry);
+    return;
+  }
+
+  final isLocalArchive = entry.isLocalArchive ?? false;
+  await pushToMangaReaderDetail(
+    ref: ref,
+    archiveId: isLocalArchive ? entry.id : null,
+    context: context,
+    lang: entry.lang ?? '',
+    mangaM: entry,
+    source: entry.source ?? '',
+    sourceId: entry.sourceId,
+  );
+}
+
+/// The badges at the top of a library cover: Local, the number of
+/// downloaded chapters, and the number of unread ones, each in its own
+/// status colour. Renders nothing when there is nothing to count, so a cover
+/// never carries an empty "0".
+class LibraryBadgeWidget extends ConsumerWidget {
+  final Manga entry;
+  final bool showLocal;
+  final bool showDownloaded;
+  final Settings settings;
+
+  const LibraryBadgeWidget({
+    super.key,
+    required this.entry,
+    required this.showLocal,
+    required this.showDownloaded,
+    required this.settings,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final isLocalArchive = entry.isLocalArchive ?? false;
+    final hasLocal = showLocal && isLocalArchive;
+
+    int downloadCount = 0;
+    if (showDownloaded) {
+      final downloadedIds =
+          ref.watch(downloadedChapterIdsProvider).asData?.value ??
+          const <int>{};
+      for (final c in entry.chapters) {
+        if (c.id != null && downloadedIds.contains(c.id)) {
+          downloadCount++;
+        }
+      }
+    }
+
+    // Scanlator-aware: the badge count respects the per-manga scanlator filter.
+    final unreadCount = entry.unreadChaptersCount(settings);
+
+    if (!hasLocal && downloadCount == 0 && unreadCount == 0) {
+      return const SizedBox.shrink();
+    }
+
+    final c = context.shiori.color;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      spacing: 2,
+      children: [
+        if (hasLocal) EntryBadgeChip(label: context.l10n.local),
+        if (downloadCount > 0)
+          EntryBadgeChip(label: downloadCount.toString(), tone: c.downloaded),
+        if (unreadCount > 0)
+          EntryBadgeChip(label: unreadCount.toString(), tone: c.unread),
+      ],
+    );
+  }
+}

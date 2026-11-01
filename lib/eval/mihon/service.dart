@@ -1,0 +1,503 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+
+import 'package:http_interceptor/http_interceptor.dart';
+import 'package:mangayomi/eval/http_response_extensions.dart';
+import 'package:mangayomi/eval/model/filter.dart';
+import 'package:mangayomi/eval/model/m_chapter.dart';
+import 'package:mangayomi/eval/model/m_manga.dart';
+import 'package:mangayomi/eval/model/m_pages.dart';
+import 'package:mangayomi/eval/model/source_preference.dart';
+import 'package:mangayomi/models/page.dart';
+import 'package:mangayomi/models/source.dart';
+import 'package:mangayomi/models/video.dart';
+import 'package:mangayomi/repositories/settings_repository.dart';
+import 'package:mangayomi/services/http/cf_proxy_store.dart';
+import 'package:mangayomi/services/http/m_client.dart';
+import 'package:mangayomi/utils/constant.dart';
+
+import '../../models/manga.dart';
+import '../interface.dart';
+import 'models.dart';
+
+/// Some Mihon sources return memo data without repeating the requested slug.
+/// The memo enriches that address; storing it alone loses the work on refresh.
+String resolveMihonDetailUrl(String requestedUrl, String? returnedUrl) {
+  const memoMarker = '|mangayomi-memo|';
+  final returned = returnedUrl?.trim() ?? '';
+  if (returned.isEmpty) return requestedUrl;
+  if (returned.startsWith(memoMarker)) {
+    final base = requestedUrl.split(memoMarker).first;
+    return base.isEmpty ? requestedUrl : '$base$returned';
+  }
+  return returned;
+}
+
+class MihonExtensionService implements ExtensionService {
+  late String androidProxyServer;
+  @override
+  late Source source;
+  late final InterceptedClient client = MClient.init();
+
+  MihonExtensionService(this.source, this.androidProxyServer);
+
+  @override
+  void dispose() {}
+
+  @override
+  Map<String, String> getHeaders() {
+    return source.headers != null && source.headers!.isNotEmpty
+        ? (jsonDecode(source.headers!) as Map?)?.toMapStringString ?? {}
+        : {};
+  }
+
+  @override
+  bool get supportsLatest {
+    return source.supportLatest ?? false;
+  }
+
+  @override
+  String get sourceBaseUrl {
+    return source.baseUrl!;
+  }
+
+  @override
+  Future<MPages> getPopular(int page) async {
+    final name = source.itemType == ItemType.anime ? "Anime" : "Manga";
+    final res = await _dalvik({
+      "method": "getPopular$name",
+      "page": page + 1,
+      "search": "",
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final pages = MangaPages.fromJson(data, source.itemType);
+    return MPages(
+      list: pages.list
+          .map(
+            (e) => MManga(
+              name: e.title,
+              link: e.url,
+              artist: e.artist,
+              author: e.author,
+              description: e.description,
+              genre: e.genre,
+              status: e.status,
+              imageUrl: e.thumbnailUrl,
+              chapters: [],
+            ),
+          )
+          .toList(),
+      hasNextPage: pages.hasNextPage,
+    );
+  }
+
+  @override
+  Future<MPages> getLatestUpdates(int page) async {
+    final name = source.itemType == ItemType.anime ? "Anime" : "Manga";
+    final res = await _dalvik({
+      "method": "getLatest$name",
+      "page": page + 1,
+      "search": "",
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final pages = MangaPages.fromJson(data, source.itemType);
+    return MPages(
+      list: pages.list
+          .map(
+            (e) => MManga(
+              name: e.title,
+              link: e.url,
+              artist: e.artist,
+              author: e.author,
+              description: e.description,
+              genre: e.genre,
+              status: e.status,
+              imageUrl: e.thumbnailUrl,
+              chapters: [],
+            ),
+          )
+          .toList(),
+      hasNextPage: pages.hasNextPage,
+    );
+  }
+
+  @override
+  Future<MPages> search(String query, int page, List<dynamic> filters) async {
+    final name = source.itemType == ItemType.anime ? "Anime" : "Manga";
+    final res = await _dalvik({
+      "method": "getSearch$name",
+      "page": max(1, page),
+      "search": query,
+      "filterList": _convertFilters(filters),
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final pages = MangaPages.fromJson(data, source.itemType);
+    return MPages(
+      list: pages.list
+          .map(
+            (e) => MManga(
+              name: e.title,
+              link: e.url,
+              artist: e.artist,
+              author: e.author,
+              description: e.description,
+              genre: e.genre,
+              status: e.status,
+              imageUrl: e.thumbnailUrl,
+              chapters: [],
+            ),
+          )
+          .toList(),
+      hasNextPage: pages.hasNextPage,
+    );
+  }
+
+  @override
+  Future<MManga> getDetail(String url) async {
+    final name = source.itemType == ItemType.anime ? "Anime" : "Manga";
+    final res = await _dalvik({
+      "method": "getDetails$name",
+      if (source.itemType == ItemType.manga) "mangaData": {"url": url},
+      if (source.itemType == ItemType.anime) "animeData": {"url": url},
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final chapters = await getChapterList(url);
+    return MManga(
+      name: data['title'],
+      link: resolveMihonDetailUrl(url, data['url'] as String?),
+      artist: data['artist'],
+      author: data['author'],
+      description: data['description'],
+      genre:
+          (data['genre'] as String?)
+              ?.split(',')
+              .map((e) => e.toString())
+              .toList() ??
+          [],
+      status: switch (data['status'] as int?) {
+        1 => Status.ongoing,
+        2 => Status.completed,
+        4 => Status.publishingFinished,
+        5 => Status.canceled,
+        6 => Status.onHiatus,
+        _ => Status.unknown,
+      },
+      imageUrl: data['thumbnail_url'],
+      chapters: chapters,
+    );
+  }
+
+  Future<List<MChapter>> getChapterList(String url) async {
+    final res = await _dalvik({
+      "method": source.itemType == ItemType.anime
+          ? "getEpisodeList"
+          : "getChapterList",
+      if (source.itemType == ItemType.manga) "mangaData": {"url": url},
+      if (source.itemType == ItemType.anime) "animeData": {"url": url},
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as List;
+    return data
+        .map(
+          (e) => MChapter(
+            name: e['name'],
+            url: e['url'],
+            dateUpload:
+                (e['date_upload'] as int?)?.toString() ??
+                DateTime.now().millisecondsSinceEpoch.toString(),
+            scanlator: e['scanlator'],
+          ),
+        )
+        .toList();
+  }
+
+  @override
+  Future<List<PageUrl>> getPageList(String url) async {
+    final res = await _dalvik({
+      "method": "getPageList",
+      "chapterData": {"url": url},
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as List;
+    return data
+        .map(
+          (e) => PageUrl(
+            e['imageUrl'] as String? ?? '',
+            headers: (e['headers'] as Map?)?.toMapStringString,
+          ),
+        )
+        .toList();
+  }
+
+  @override
+  Future<List<Video>> getVideoList(String url) async {
+    final res = await _dalvik({
+      "method": "getVideoList",
+      "episodeData": {"url": url},
+      "preferences": getSourcePreferences(),
+      "data": source.sourceCode,
+      "lang": source.lang,
+      "sourceId": source.id?.toString(),
+    });
+    final data = jsonDecode(res.body) as List;
+    final videos = <Video>[];
+    for (final e in data) {
+      if (e is! Map) continue;
+      final videoUrl = (e['videoUrl'] as String?)?.trim() ?? '';
+      final rawUrl = (e['url'] as String?)?.trim() ?? '';
+      final effectiveUrl = (videoUrl.isNotEmpty && videoUrl != 'null')
+          ? videoUrl
+          : rawUrl;
+      if (effectiveUrl.isEmpty || effectiveUrl == 'null') continue;
+      final originalUrl = (rawUrl.isNotEmpty && rawUrl != 'null')
+          ? rawUrl
+          : effectiveUrl;
+      final rawQuality = (e['quality'] as String?)?.trim() ?? '';
+      final rawTitle = (e['videoTitle'] as String?)?.trim() ?? '';
+      final quality = rawQuality.isNotEmpty
+          ? rawQuality
+          : (rawTitle.isNotEmpty ? rawTitle : 'Default');
+
+      final tempHeaders =
+          e['headers']?['namesAndValues\$okhttp'] as List<dynamic>?;
+      final Map<String, String> headers = {};
+      if (tempHeaders != null) {
+        for (var i = 0; i + 1 < tempHeaders.length; i += 2) {
+          headers[tempHeaders[i].toString()] = tempHeaders[i + 1].toString();
+        }
+      } else if (e['headers'] is Map) {
+        (e['headers'] as Map).forEach((k, v) {
+          if (k != null && v != null && k != 'namesAndValues\$okhttp') {
+            headers[k.toString()] = v.toString();
+          }
+        });
+      }
+      videos.add(
+        Video(
+          effectiveUrl,
+          quality,
+          originalUrl,
+          headers: headers,
+          audios:
+              (e['audioTracks'] as List?)
+                  ?.map(
+                    (e) => Track(
+                      file: e['file'] ?? e['url'],
+                      label: e['label'] ?? e['lang'],
+                    ),
+                  )
+                  .toList() ??
+              [],
+          subtitles:
+              (e['subtitleTracks'] as List?)
+                  ?.map(
+                    (e) => Track(
+                      file: e['file'] ?? e['url'],
+                      label: e['label'] ?? e['lang'],
+                    ),
+                  )
+                  .toList() ??
+              [],
+        ),
+      );
+    }
+    return videos;
+  }
+
+  @override
+  Future<String> getHtmlContent(String name, String url) async {
+    return "";
+  }
+
+  @override
+  Future<String> cleanHtmlContent(String html) async {
+    return html;
+  }
+
+  @override
+  FilterList getFilterList() {
+    return source.getFilterList() ?? FilterList([]);
+  }
+
+  @override
+  List<SourcePreference> getSourcePreferences() {
+    if (source.preferenceList == null) {
+      return [];
+    }
+    final data = jsonDecode(source.preferenceList!) as List;
+    return data.map((e) => SourcePreference.fromJson(e)).toList();
+  }
+
+  List<dynamic> _convertFilters(List<dynamic> filters) {
+    return filters.expand((e) sync* {
+      if (e is TextFilter) {
+        yield {"name": e.name, "stateString": e.state, "type": "TextFilter"};
+      } else if (e is GroupFilter) {
+        yield {
+          "name": e.name,
+          "stateList": e.state.expand((e) sync* {
+            if (e is CheckBoxFilter) {
+              yield {
+                "name": e.name,
+                "stateBoolean": e.state,
+                "type": "CheckBoxFilter",
+              };
+            } else if (e is TriStateFilter) {
+              yield {
+                "name": e.name,
+                "stateInt": e.state,
+                "type": "TriStateFilter",
+              };
+            }
+          }).toList(),
+          "type": "GroupFilter",
+        };
+      } else if (e is SelectFilter) {
+        yield {"name": e.name, "stateInt": e.state, "type": "SelectFilter"};
+      } else if (e is SortFilter) {
+        yield {
+          "name": e.name,
+          "stateSort": {"ascending": e.state.ascending, "index": e.state.index},
+          "type": "SortFilter",
+        };
+      }
+    }).toList();
+  }
+
+  Map<String, String> getCookie() {
+    final rawUa = settingsRepository.current.userAgent?.trim();
+    final userAgent =
+        (rawUa != null && rawUa.isNotEmpty) ? rawUa : defaultUserAgent;
+    final cfProxyUrl = CfProxyStore.url.trim();
+    return {
+      if (source.baseUrl != null && source.baseUrl!.isNotEmpty)
+        ...MClient.getCookiesPref(source.baseUrl!),
+      'user-agent': userAgent,
+      // Which source of the extension this call is for. The id sent alongside
+      // it is a Dart hashCode of the original one (see ExtensionStoreService),
+      // which the server cannot reproduce on the JVM, so an extension holding
+      // several sources would otherwise always resolve to the same one.
+      'source-base-url': ?source.baseUrl,
+      // Lets an extension server that supports it solve the challenge itself,
+      // which is better placed than the retry below: it owns the request and
+      // its cookie jar. Servers that don't support it ignore the header.
+      if (cfProxyUrl.isNotEmpty) 'cf-proxy-url': cfProxyUrl,
+      // Where the server reaches this app's WebViews, and the secret it must
+      // present: extension WebViews then run here as real WebViews.
+      if (!Platform.isLinux && cfPort > 0) ...{
+        'x-mangayomi-webview-port': cfPort.toString(),
+        'x-mangayomi-webview-token': webviewBridgeToken,
+      },
+    };
+  }
+
+  /// Posts [body] to the extension server, with one best-effort compatibility
+  /// retry through the configured bypass proxy for legacy bridge servers.
+  ///
+  /// These extensions run inside the extension server, so their requests never
+  /// pass through [MClient]'s retry policy. The legacy bridge response contains
+  /// only an HTTP status and no challenge header, so this fallback must never
+  /// be presented to the user as proof that Cloudflare caused the error.
+  Future<Response> _dalvik(Map<String, dynamic> body) async {
+    var res = await _postDalvik(body);
+    if (_isForbiddenResponse(res)) {
+      final proxyUrl = CfProxyStore.url.trim();
+      if (proxyUrl.isNotEmpty &&
+          await solveWithCfProxy(proxyUrl, source.baseUrl!)) {
+        // solveWithCfProxy persisted the clearance cookies + user-agent, and
+        // getCookie() reads them back, so the retry carries them.
+        res = await _postDalvik(body);
+      } else if (!Platform.isLinux && cfPort > 0 && source.baseUrl != null) {
+        try {
+          final resolveRes = await client.post(
+            Uri.parse('http://127.0.0.1:$cfPort/resolve_cf'),
+            body: jsonEncode({'url': source.baseUrl!}),
+          );
+          if (resolveRes.statusCode == 200) {
+            final data = jsonDecode(resolveRes.body) as Map<String, dynamic>;
+            if (data['result'] == true) {
+              res = await _postDalvik(body);
+            }
+          }
+        } catch (_) {}
+      }
+    }
+    hasError(res);
+    return res;
+  }
+
+  Future<Response> _postDalvik(Map<String, dynamic> body) async {
+    if (!Platform.isLinux && cfPort == 0) {
+      await webviewServer();
+    }
+    return client.post(
+      Uri.parse("$androidProxyServer/dalvik"),
+      body: jsonEncode(body),
+      headers: getCookie(),
+    );
+  }
+
+  bool _isForbiddenResponse(Response response) {
+    try {
+      final decoded = jsonDecode(response.body);
+      return decoded is Map<String, dynamic> &&
+          decoded['error'] != null &&
+          decoded['code'] == 403;
+    } catch (_) {
+      // Not JSON: hasError() reports the malformed-response case itself.
+      return false;
+    }
+  }
+}
+
+void hasError(Response response) {
+  Map<String, dynamic>? decoded;
+  try {
+    final parsed = jsonDecode(response.body);
+    if (parsed is Map<String, dynamic>) decoded = parsed;
+  } catch (_) {
+    // Not valid JSON - the Android extension bridge (the device/emulator
+    // configured in Settings > Browse > Extension Server) returned something
+    // other than the expected response, most likely because it crashed, was
+    // unreachable, or dropped the connection mid-response. Say so clearly
+    // instead of letting the caller's own jsonDecode() on the same empty/
+    // malformed body fail moments later with a bare "Unexpected end of
+    // input" that gives no indication of the actual cause.
+    if (response.body.trim().isEmpty) {
+      throw "The Android extension bridge server returned an empty response "
+          "(HTTP ${response.statusCode}). Check that the device/emulator set "
+          "in Settings > Browse > Extension Server is running and reachable.";
+    }
+    throw "The Android extension bridge server returned an unexpected "
+        "response (HTTP ${response.statusCode}): ${response.body}";
+  }
+
+  final errorMessage = decoded?['error'];
+  final code = decoded?['code'];
+  if (errorMessage != null && code != null) {
+    throw "$errorMessage \n\n\nstatusCode: $code";
+  }
+}

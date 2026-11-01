@@ -1,0 +1,232 @@
+import 'package:flutter/material.dart';
+import 'package:shiori/shiori.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mangayomi/modules/browse/browse_screen.dart';
+import 'package:mangayomi/modules/widgets/custom_sliver_grouped_list_view.dart';
+import 'package:mangayomi/models/manga.dart';
+import 'package:mangayomi/models/source.dart';
+import 'package:mangayomi/repositories/source_repository.dart';
+import 'package:mangayomi/modules/browse/sources/widgets/source_list_tile.dart';
+import 'package:mangayomi/modules/more/settings/browse/providers/browse_state_provider.dart';
+import 'package:mangayomi/modules/widgets/error_state.dart';
+import 'package:mangayomi/modules/browse/widgets/extension_server_warning_banner.dart';
+import 'package:mangayomi/providers/l10n_providers.dart';
+import 'package:mangayomi/utils/language.dart';
+import 'package:mangayomi/utils/platform_utils.dart';
+
+final getSourcesStreamProvider = StreamProvider.family<List<Source>, ItemType>((
+  ref,
+  itemType,
+) {
+  return sourceRepository.watchAddedAndActiveByItemType(itemType);
+});
+
+class SourcesScreen extends ConsumerStatefulWidget {
+  final Function(int) tabIndex;
+  final List<BrowseTab> tabs;
+  final ItemType itemType;
+  const SourcesScreen({
+    required this.tabIndex,
+    required this.itemType,
+    required this.tabs,
+    super.key,
+  });
+
+  @override
+  ConsumerState<SourcesScreen> createState() => _SourcesScreenState();
+}
+
+class _SourcesScreenState extends ConsumerState<SourcesScreen> {
+  final controller = ScrollController();
+
+  // Stable focus nodes per source id (source / Latest / Pin buttons) so d-pad
+  // focus follows a source when pinning moves it to another group.
+  final Map<int, FocusNode> _srcNodes = {};
+  final Map<int, FocusNode> _latestNodes = {};
+  final Map<int, FocusNode> _pinNodes = {};
+
+  FocusNode _node(Map<int, FocusNode> m, int? id) =>
+      m.putIfAbsent(id ?? -1, () => FocusNode());
+
+  /// One source entry: the TV 3-button row on Android TV, else the classic tile.
+  ///
+  /// [shareNodes] keys the row's focus nodes by source id so d-pad focus follows
+  /// a source when pinning moves it between the pinned and language groups
+  /// (mutually exclusive, so never contested). Last used is a *second* row for a
+  /// source already in one of those groups; a FocusNode attaches to one widget
+  /// at a time, so it gets its own nodes to stay focusable.
+  Widget _row(Source source, {bool shareNodes = true}) {
+    if (isTv) {
+      return TvSourceRow(
+        source: source,
+        itemType: widget.itemType,
+        sourceNode: shareNodes ? _node(_srcNodes, source.id) : null,
+        latestNode: shareNodes ? _node(_latestNodes, source.id) : null,
+        pinNode: shareNodes ? _node(_pinNodes, source.id) : null,
+      );
+    }
+    return SourceListTile(source: source, itemType: widget.itemType);
+  }
+
+  @override
+  void dispose() {
+    for (final n in [
+      ..._srcNodes.values,
+      ..._latestNodes.values,
+      ..._pinNodes.values,
+    ]) {
+      n.dispose();
+    }
+    controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final l10n = l10nLocalizations(context)!;
+    final sourcesStream = ref.watch(getSourcesStreamProvider(widget.itemType));
+    final tvHorizontalInset = tvHorizontalSafeInset(context);
+
+    return Padding(
+      padding: EdgeInsets.only(
+        top: ShioriSpace.s12,
+        left: tvHorizontalInset,
+        right: tvHorizontalInset,
+      ),
+      child: sourcesStream.when(
+        data: (snapshotData) {
+          final showNSFW = ref.watch(showNSFWStateProvider);
+          List<Source> sources = snapshotData
+              .where((e) => showNSFW || !(e.isNsfw ?? false))
+              .toList();
+          if (sources.isEmpty) {
+            return Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                const ExtensionServerWarningBanner(),
+                ShioriEmptyState(
+                  icon: Symbols.extension_rounded,
+                  title: context.l10n.no_sources_installed,
+                  compact: true,
+                  actionLabel: context.l10n.show_extensions,
+                  onAction: () {
+                    final extensionIndex = widget.tabs.indexWhere(
+                      (t) =>
+                          t.type == widget.itemType &&
+                          t.kind == BrowseTabKind.extensions,
+                    );
+                    if (extensionIndex != -1) {
+                      widget.tabIndex(extensionIndex);
+                    }
+                  },
+                ),
+                ShioriSectionHeader(title: l10n.other, overline: true),
+                SourceListTile(
+                  source: Source(
+                    name: "local",
+                    lang: "",
+                    itemType: widget.itemType,
+                  ),
+                  itemType: widget.itemType,
+                ),
+              ],
+            );
+          }
+          final lastUsedEntries = sources.where((e) => e.lastUsed!).toList();
+          final isPinnedEntries = sources.where((e) => e.isPinned!).toList();
+          final allEntriesWithoutIspinned = sources
+              .where((element) => !element.isPinned!)
+              .toList();
+          final showWarning = sources
+              .where((e) => e.sourceCodeLanguage == SourceCodeLanguage.mihon)
+              .isNotEmpty;
+          return Scrollbar(
+            interactive: true,
+            controller: controller,
+            thickness: 12,
+            radius: const Radius.circular(ShioriShape.card),
+            child: CustomScrollView(
+              controller: controller,
+              slivers: [
+                if (showWarning)
+                  const SliverToBoxAdapter(
+                    child: ExtensionServerWarningBanner(),
+                  ),
+                CustomSliverGroupedListView<Source, String>(
+                  elements: lastUsedEntries,
+                  groupBy: (element) => "",
+                  groupSeparatorBuilder: (String groupByValue) =>
+                      ShioriSectionHeader(
+                        title: l10n.last_used,
+                        overline: true,
+                      ),
+                  itemBuilder: (context, Source element) {
+                    return _row(element, shareNodes: false);
+                  },
+                  groupComparator: (group1, group2) => group1.compareTo(group2),
+                  itemComparator: (item1, item2) =>
+                      item1.name!.compareTo(item2.name!),
+                  order: GroupedListOrder.ASC,
+                ),
+                CustomSliverGroupedListView<Source, String>(
+                  elements: isPinnedEntries,
+                  groupBy: (element) => "",
+                  groupSeparatorBuilder: (String groupByValue) =>
+                      ShioriSectionHeader(title: l10n.pinned, overline: true),
+                  itemBuilder: (context, Source element) {
+                    return _row(element);
+                  },
+                  groupComparator: (group1, group2) => group1.compareTo(group2),
+                  itemComparator: (item1, item2) =>
+                      item1.name!.compareTo(item2.name!),
+                  order: GroupedListOrder.ASC,
+                ),
+                CustomSliverGroupedListView<Source, String>(
+                  elements: allEntriesWithoutIspinned,
+                  groupBy: (element) =>
+                      languageName(context, element.lang!.toLowerCase()),
+                  groupSeparatorBuilder: (String groupByValue) =>
+                      ShioriSectionHeader(title: groupByValue, overline: true),
+                  itemBuilder: (context, Source element) {
+                    return _row(element);
+                  },
+                  groupComparator: (group1, group2) => group1.compareTo(group2),
+                  itemComparator: (item1, item2) =>
+                      item1.name!.compareTo(item2.name!),
+                  order: GroupedListOrder.ASC,
+                ),
+                SliverToBoxAdapter(
+                  child: Column(
+                    children: [
+                      ShioriSectionHeader(title: l10n.other, overline: true),
+                      SourceListTile(
+                        source: Source(
+                          name: "local",
+                          lang: "",
+                          itemType: widget.itemType,
+                        ),
+                        itemType: widget.itemType,
+                      ),
+                    ],
+                  ),
+                ),
+                // Trailing room rather than padding around the viewport, so rows
+                // scroll under the translucent bar, which is what gives it
+                // something to blur, and only the last one clears it.
+                SliverToBoxAdapter(
+                  child: SizedBox(height: pageBottomInsets(context).bottom),
+                ),
+              ],
+            ),
+          );
+        },
+        error: (error, _) => ErrorState(
+          detail: error.toString(),
+          onRetry: () =>
+              ref.invalidate(getSourcesStreamProvider(widget.itemType)),
+        ),
+        loading: () => const ShioriLoading(),
+      ),
+    );
+  }
+}
